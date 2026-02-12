@@ -9,8 +9,8 @@ from PIL import Image
 
 COLORMAPS = ["inferno", "magma", "viridis", "plasma", "hot", "cool", "gray", "jet"]
 
-# 메모리 절약을 위해 주파수 쌍(f1, f2)을 청크 단위로 처리
-_CHUNK_SIZE = 8192
+# 청크당 최대 메모리 목표: ~200 MB (complex128 = 16 bytes)
+_TARGET_CHUNK_BYTES = 200 * 1024 * 1024
 
 
 def _to_mono(waveform: torch.Tensor) -> torch.Tensor:
@@ -42,6 +42,7 @@ def _compute_bispectrum(
     hop_length: int,
     win_length: int,
     normalize: bool,
+    max_frames: int,
 ) -> np.ndarray:
     """
     Bispectrum 계산
@@ -49,9 +50,21 @@ def _compute_bispectrum(
 
     삼각 영역(0 ≤ f2 ≤ f1, f1+f2 < half)만 계산.
     normalize=True 이면 이중일관성(bicoherence²) 반환 [0, 1].
+    프레임 수가 max_frames를 초과하면 균등 서브샘플링으로 제한.
     """
     half = nfft // 2 + 1
     X = _make_frames(audio_np, win_length, hop_length, nfft)  # [n_frames, half]
+
+    # 프레임 수 제한: 균등 간격 서브샘플링
+    n_frames = len(X)
+    if n_frames > max_frames:
+        idx = np.linspace(0, n_frames - 1, max_frames, dtype=int)
+        X = X[idx]
+
+    n_frames = len(X)
+
+    # 메모리에 맞는 청크 크기 자동 계산 (복소128 = 16 bytes, 3개 배열)
+    chunk_size = max(256, _TARGET_CHUNK_BYTES // (n_frames * 16 * 3))
 
     # 유효한 (f1, f2) 쌍 인덱스 생성
     f1_g, f2_g = np.mgrid[0:half, 0:half]
@@ -62,12 +75,12 @@ def _compute_bispectrum(
     f2_v = f2_g[valid]
     f12_v = f12_g[valid]
 
-    # 청크 단위 bispectrum 누적 (메모리 제한)
+    # 청크 단위 bispectrum 누적
     bispec_v = np.zeros(len(f1_v), dtype=np.complex128)
     denom_v = np.zeros(len(f1_v), dtype=np.float64) if normalize else None
 
-    for i in range(0, len(f1_v), _CHUNK_SIZE):
-        sl = slice(i, i + _CHUNK_SIZE)
+    for i in range(0, len(f1_v), chunk_size):
+        sl = slice(i, i + chunk_size)
         Xf1 = X[:, f1_v[sl]]    # [n_frames, chunk]
         Xf2 = X[:, f2_v[sl]]
         Xf12 = X[:, f12_v[sl]]
@@ -211,6 +224,16 @@ class AudioToBispectrum:
                     "INT",
                     {"default": 768, "min": 256, "max": 4096, "step": 64},
                 ),
+                "max_frames": (
+                    "INT",
+                    {
+                        "default": 500,
+                        "min": 50,
+                        "max": 5000,
+                        "step": 50,
+                        "tooltip": "사용할 최대 프레임 수. 오디오가 길면 균등 서브샘플링. 클수록 정확하지만 느림",
+                    },
+                ),
                 "show_axes": ("BOOLEAN", {"default": True}),
             }
         }
@@ -231,6 +254,7 @@ class AudioToBispectrum:
         colormap,
         width,
         height,
+        max_frames,
         show_axes,
     ):
         waveform = audio["waveform"]      # [1, C, T]
@@ -240,7 +264,7 @@ class AudioToBispectrum:
         audio_np = mono.numpy()
 
         bispec = _compute_bispectrum(
-            audio_np, nfft, hop_length, win_length, normalize
+            audio_np, nfft, hop_length, win_length, normalize, max_frames
         )
 
         image = _render_bispectrum(
