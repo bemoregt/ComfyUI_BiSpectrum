@@ -9,20 +9,23 @@ from PIL import Image
 
 COLORMAPS = ["inferno", "magma", "viridis", "plasma", "hot", "cool", "gray", "jet"]
 
-# 청크당 최대 메모리 목표: ~200 MB (complex128 = 16 bytes)
+# 청크당 메모리 목표: ~200 MB (complex128 = 16 bytes)
 _TARGET_CHUNK_BYTES = 200 * 1024 * 1024
 
 
 def _to_mono(waveform: torch.Tensor) -> torch.Tensor:
     """waveform: [1, C, T] → [T] mono float32"""
-    audio = waveform.squeeze(0)  # [C, T]
+    audio = waveform.squeeze(0)
     if audio.ndim == 2:
         audio = audio.mean(dim=0)
     return audio.float()
 
 
 def _make_frames(audio_np: np.ndarray, win_length: int, hop_length: int, nfft: int) -> np.ndarray:
-    """오디오를 윈도우 프레임으로 나눠 rfft 적용 → [n_frames, nfft//2+1] complex128"""
+    """
+    오디오 → 윈도우 프레임 → full FFT
+    반환: [n_frames, nfft] complex128
+    """
     window = np.hanning(win_length)
     N = len(audio_np)
     frames = []
@@ -30,10 +33,10 @@ def _make_frames(audio_np: np.ndarray, win_length: int, hop_length: int, nfft: i
         frame = audio_np[start: start + win_length]
         if len(frame) < win_length:
             frame = np.pad(frame, (0, win_length - len(frame)))
-        frames.append(np.fft.rfft(frame * window, n=nfft))
+        frames.append(np.fft.fft(frame * window, n=nfft))
     if not frames:
-        frames.append(np.zeros(nfft // 2 + 1, dtype=complex))
-    return np.array(frames, dtype=np.complex128)  # [n_frames, half]
+        frames.append(np.zeros(nfft, dtype=complex))
+    return np.array(frames, dtype=np.complex128)  # [n_frames, nfft]
 
 
 def _compute_bispectrum(
@@ -43,47 +46,57 @@ def _compute_bispectrum(
     win_length: int,
     normalize: bool,
     max_frames: int,
+    fmax_hz: float,
+    sample_rate: int,
 ) -> np.ndarray:
     """
-    Bispectrum 계산
-      B(f1, f2) = E[ X(f1) · X(f2) · X*(f1+f2) ]
+    Full 2D Bispectrum 계산
+      B(f1, f2) = E[ X(f1) · X(f2) · X*((f1+f2) mod N) ]
 
-    삼각 영역(0 ≤ f2 ≤ f1, f1+f2 < half)만 계산.
-    normalize=True 이면 이중일관성(bicoherence²) 반환 [0, 1].
-    프레임 수가 max_frames를 초과하면 균등 서브샘플링으로 제한.
+    양/음 주파수 모두 포함한 전체 2D 평면을 계산.
+    반환: [2*bin_max+1, 2*bin_max+1] float64 (magnitude 또는 bicoherence²)
+    축 순서: [f1_index, f2_index], f1/f2 ∈ [-fmax, +fmax]
     """
-    half = nfft // 2 + 1
-    X = _make_frames(audio_np, win_length, hop_length, nfft)  # [n_frames, half]
+    X = _make_frames(audio_np, win_length, hop_length, nfft)  # [n_frames, nfft]
 
-    # 프레임 수 제한: 균등 간격 서브샘플링
+    # 프레임 수 제한 (균등 서브샘플링)
     n_frames = len(X)
     if n_frames > max_frames:
         idx = np.linspace(0, n_frames - 1, max_frames, dtype=int)
         X = X[idx]
-
     n_frames = len(X)
 
-    # 메모리에 맞는 청크 크기 자동 계산 (복소128 = 16 bytes, 3개 배열)
+    # fmax에 해당하는 bin 수
+    freq_res = sample_rate / nfft          # Hz / bin
+    bin_max = max(1, int(fmax_hz / freq_res))
+    bin_max = min(bin_max, nfft // 2)
+
+    # f1, f2 ∈ [-bin_max, ..., bin_max] (정수 bin 인덱스)
+    bins = np.arange(-bin_max, bin_max + 1)  # length = 2*bin_max+1
+    nb = len(bins)
+
+    # 모든 (f1, f2) 조합 → nfft 기준 양수 인덱스로 변환
+    k1_g, k2_g = np.meshgrid(bins, bins, indexing="ij")   # [nb, nb]
+    k12_g = (k1_g + k2_g) % nfft
+    k1_mod = k1_g % nfft
+    k2_mod = k2_g % nfft
+
+    k1_v = k1_mod.ravel()    # [nb²]
+    k2_v = k2_mod.ravel()
+    k12_v = k12_g.ravel()
+    n_pairs = len(k1_v)
+
+    # 청크 크기 자동 결정
     chunk_size = max(256, _TARGET_CHUNK_BYTES // (n_frames * 16 * 3))
 
-    # 유효한 (f1, f2) 쌍 인덱스 생성
-    f1_g, f2_g = np.mgrid[0:half, 0:half]
-    f12_g = f1_g + f2_g
-    valid = (f12_g < half) & (f2_g <= f1_g)
+    bispec_v = np.zeros(n_pairs, dtype=np.complex128)
+    denom_v = np.zeros(n_pairs, dtype=np.float64) if normalize else None
 
-    f1_v = f1_g[valid]   # [n_valid]
-    f2_v = f2_g[valid]
-    f12_v = f12_g[valid]
-
-    # 청크 단위 bispectrum 누적
-    bispec_v = np.zeros(len(f1_v), dtype=np.complex128)
-    denom_v = np.zeros(len(f1_v), dtype=np.float64) if normalize else None
-
-    for i in range(0, len(f1_v), chunk_size):
+    for i in range(0, n_pairs, chunk_size):
         sl = slice(i, i + chunk_size)
-        Xf1 = X[:, f1_v[sl]]    # [n_frames, chunk]
-        Xf2 = X[:, f2_v[sl]]
-        Xf12 = X[:, f12_v[sl]]
+        Xf1 = X[:, k1_v[sl]]      # [n_frames, chunk]
+        Xf2 = X[:, k2_v[sl]]
+        Xf12 = X[:, k12_v[sl]]
 
         triple = Xf1 * Xf2 * np.conj(Xf12)
         bispec_v[sl] = triple.mean(axis=0)
@@ -94,20 +107,17 @@ def _compute_bispectrum(
                 np.mean(np.abs(Xf12) ** 2, axis=0)
             )
 
-    # 2D 배열로 재구성 — 무효 영역은 NaN (컬러맵 범위 계산에서 제외)
-    result = np.full((half, half), np.nan, dtype=np.float64)
     if normalize:
         bic2 = np.abs(bispec_v) ** 2 / np.maximum(denom_v, 1e-30)
-        result[f1_v, f2_v] = np.clip(bic2, 0.0, 1.0)
-    else:
-        result[f1_v, f2_v] = np.abs(bispec_v)
+        return np.clip(bic2, 0.0, 1.0).reshape(nb, nb)
 
-    return result
+    return np.abs(bispec_v).reshape(nb, nb)
 
 
 def _render_bispectrum(
     bispec: np.ndarray,
     sample_rate: int,
+    nfft: int,
     normalize: bool,
     log_scale: bool,
     colormap: str,
@@ -117,58 +127,44 @@ def _render_bispectrum(
     show_axes: bool,
 ) -> torch.Tensor:
     """Bispectrum 2D 배열 → matplotlib 렌더링 → [1, H, W, 3] float32 tensor"""
-    half = bispec.shape[0]
-    nyquist = sample_rate / 2.0
+    freq_res = sample_rate / nfft
+    bin_max = (bispec.shape[0] - 1) // 2
+    actual_fmax = bin_max * freq_res      # 실제 표시 최대 Hz
 
-    # fmax_hz=0 이면 Nyquist 전체 표시
-    display_fmax = fmax_hz if fmax_hz > 0 else nyquist
-    display_fmax = min(display_fmax, nyquist)
-
-    # 표시 영역에 해당하는 bin 인덱스 범위
-    bin_max = int(round(display_fmax / nyquist * (half - 1))) + 1
-    bin_max = min(bin_max, half)
-
-    data = bispec[:bin_max, :bin_max].copy()
+    data = bispec.copy()
 
     if log_scale and not normalize:
-        # NaN은 그대로 두고 유효값만 변환
-        valid_mask = ~np.isnan(data)
-        data[valid_mask] = np.log1p(data[valid_mask])
+        data = np.log1p(data)
 
-    # 퍼센타일 기반 컬러맵 범위 (무효 NaN 제외)
-    valid_vals = data[~np.isnan(data)]
-    if len(valid_vals) > 0 and valid_vals.max() > 0:
-        vmin = 0.0
-        vmax = float(np.percentile(valid_vals, 99.5))
-        if vmax == 0:
-            vmax = 1.0
-    else:
-        vmin, vmax = 0.0, 1.0
+    # 퍼센타일 기반 컬러맵 범위
+    flat = data.ravel()
+    pos = flat[flat > 0]
+    vmin = 0.0
+    vmax = float(np.percentile(pos, 99.5)) if len(pos) > 0 else 1.0
+    if vmax == 0:
+        vmax = 1.0
 
     dpi = 100
     fig, ax = plt.subplots(figsize=(width / dpi, height / dpi), dpi=dpi)
 
-    # NaN을 배경색(검정)으로 렌더링
-    cmap_obj = plt.get_cmap(colormap).copy()
-    cmap_obj.set_bad(color="black")
-
-    freq_tick = display_fmax
-    extent = [0, freq_tick, 0, freq_tick]
+    extent = [-actual_fmax, actual_fmax, -actual_fmax, actual_fmax]
 
     im = ax.imshow(
         data,
         origin="lower",
         aspect="auto",
         extent=extent,
-        cmap=cmap_obj,
-        interpolation="nearest",
+        cmap=colormap,
+        interpolation="bilinear",
         vmin=vmin,
         vmax=vmax,
     )
 
     if show_axes:
-        ax.set_xlabel("f₂ (Hz)")
-        ax.set_ylabel("f₁ (Hz)")
+        ax.set_xlabel("f₁ (Hz)")
+        ax.set_ylabel("f₂ (Hz)")
+        ax.axhline(0, color="white", linewidth=0.4, linestyle="--", alpha=0.4)
+        ax.axvline(0, color="white", linewidth=0.4, linestyle="--", alpha=0.4)
         if normalize:
             cb_label = "Bicoherence²"
             title = "Bispectrum — Bicoherence²"
@@ -199,8 +195,10 @@ class AudioToBispectrum:
     """
     ComfyUI 커스텀 노드: 오디오 → Bispectrum(삼중상관 스펙트럼) 이미지
 
-    Bispectrum B(f1, f2) = E[ X(f1) · X(f2) · X*(f1+f2) ]
-    는 신호의 2차 비선형 주파수 상관(위상 결합, phase coupling)을 시각화합니다.
+    B(f1, f2) = E[ X(f1) · X(f2) · X*((f1+f2) mod N) ]
+
+    양/음 주파수를 모두 포함한 전체 2D 평면을 계산하여
+    대칭 패턴과 위상 결합(phase coupling)을 시각화합니다.
     """
 
     @classmethod
@@ -215,7 +213,7 @@ class AudioToBispectrum:
                         "min": 64,
                         "max": 1024,
                         "step": 64,
-                        "tooltip": "FFT 크기. 클수록 주파수 해상도↑, 속도↓, 메모리↑",
+                        "tooltip": "FFT 크기. 클수록 주파수 해상도↑, 속도↓",
                     },
                 ),
                 "hop_length": (
@@ -225,6 +223,16 @@ class AudioToBispectrum:
                 "win_length": (
                     "INT",
                     {"default": 512, "min": 64, "max": 1024, "step": 64},
+                ),
+                "fmax": (
+                    "FLOAT",
+                    {
+                        "default": 4000.0,
+                        "min": 100.0,
+                        "max": 22050.0,
+                        "step": 500.0,
+                        "tooltip": "표시/계산할 최대 주파수 (Hz). 작을수록 해상도 높고 빠름",
+                    },
                 ),
                 "normalize": (
                     "BOOLEAN",
@@ -239,20 +247,10 @@ class AudioToBispectrum:
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "Magnitude 모드에서 log(1+|B|) 적용 (normalize=OFF일 때만 유효)",
+                        "tooltip": "log(1+|B|) 적용 — Magnitude 모드에서만 유효",
                     },
                 ),
-                "fmax": (
-                    "FLOAT",
-                    {
-                        "default": 8000.0,
-                        "min": 0.0,
-                        "max": 24000.0,
-                        "step": 500.0,
-                        "tooltip": "표시할 최대 주파수 (Hz). 0 = Nyquist 전체",
-                    },
-                ),
-                "colormap": (COLORMAPS, {"default": "inferno"}),
+                "colormap": (COLORMAPS, {"default": "jet"}),
                 "width": (
                     "INT",
                     {"default": 768, "min": 256, "max": 4096, "step": 64},
@@ -268,7 +266,7 @@ class AudioToBispectrum:
                         "min": 50,
                         "max": 5000,
                         "step": 50,
-                        "tooltip": "사용할 최대 프레임 수. 오디오가 길면 균등 서브샘플링. 클수록 정확하지만 느림",
+                        "tooltip": "최대 프레임 수. 오디오가 길면 균등 서브샘플링",
                     },
                 ),
                 "show_axes": ("BOOLEAN", {"default": True}),
@@ -286,27 +284,28 @@ class AudioToBispectrum:
         nfft,
         hop_length,
         win_length,
+        fmax,
         normalize,
         log_scale,
-        fmax,
         colormap,
         width,
         height,
         max_frames,
         show_axes,
     ):
-        waveform = audio["waveform"]      # [1, C, T]
+        waveform = audio["waveform"]       # [1, C, T]
         sample_rate = audio["sample_rate"]
 
         mono = _to_mono(waveform)
         audio_np = mono.numpy()
 
         bispec = _compute_bispectrum(
-            audio_np, nfft, hop_length, win_length, normalize, max_frames
+            audio_np, nfft, hop_length, win_length,
+            normalize, max_frames, fmax, sample_rate,
         )
 
         image = _render_bispectrum(
-            bispec, sample_rate, normalize, log_scale,
+            bispec, sample_rate, nfft, normalize, log_scale,
             colormap, fmax, width, height, show_axes,
         )
 
