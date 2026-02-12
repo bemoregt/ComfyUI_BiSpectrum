@@ -2,6 +2,8 @@
 
 ComfyUI custom node that computes the **Bispectrum** (triple correlation spectrum) of an audio signal and outputs it as an image.
 
+![이미지 스펙트럼 예시](https://github.com/bemoregt/ComfyUI_BiSpectrum/blob/main/ScrShot%2011.png)
+
 ---
 
 ## What is the Bispectrum?
