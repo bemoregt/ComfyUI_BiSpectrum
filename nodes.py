@@ -94,8 +94,8 @@ def _compute_bispectrum(
                 np.mean(np.abs(Xf12) ** 2, axis=0)
             )
 
-    # 2D 배열로 재구성
-    result = np.zeros((half, half), dtype=np.float64)
+    # 2D 배열로 재구성 — 무효 영역은 NaN (컬러맵 범위 계산에서 제외)
+    result = np.full((half, half), np.nan, dtype=np.float64)
     if normalize:
         bic2 = np.abs(bispec_v) ** 2 / np.maximum(denom_v, 1e-30)
         result[f1_v, f2_v] = np.clip(bic2, 0.0, 1.0)
@@ -111,32 +111,59 @@ def _render_bispectrum(
     normalize: bool,
     log_scale: bool,
     colormap: str,
+    fmax_hz: float,
     width: int,
     height: int,
     show_axes: bool,
 ) -> torch.Tensor:
     """Bispectrum 2D 배열 → matplotlib 렌더링 → [1, H, W, 3] float32 tensor"""
     half = bispec.shape[0]
-    freq_max = sample_rate / 2.0
+    nyquist = sample_rate / 2.0
 
-    data = bispec.copy()
+    # fmax_hz=0 이면 Nyquist 전체 표시
+    display_fmax = fmax_hz if fmax_hz > 0 else nyquist
+    display_fmax = min(display_fmax, nyquist)
+
+    # 표시 영역에 해당하는 bin 인덱스 범위
+    bin_max = int(round(display_fmax / nyquist * (half - 1))) + 1
+    bin_max = min(bin_max, half)
+
+    data = bispec[:bin_max, :bin_max].copy()
 
     if log_scale and not normalize:
-        data = np.log1p(data)
+        # NaN은 그대로 두고 유효값만 변환
+        valid_mask = ~np.isnan(data)
+        data[valid_mask] = np.log1p(data[valid_mask])
+
+    # 퍼센타일 기반 컬러맵 범위 (무효 NaN 제외)
+    valid_vals = data[~np.isnan(data)]
+    if len(valid_vals) > 0 and valid_vals.max() > 0:
+        vmin = 0.0
+        vmax = float(np.percentile(valid_vals, 99.5))
+        if vmax == 0:
+            vmax = 1.0
+    else:
+        vmin, vmax = 0.0, 1.0
 
     dpi = 100
     fig, ax = plt.subplots(figsize=(width / dpi, height / dpi), dpi=dpi)
 
-    # Hz 축 범위 (0 ~ Nyquist)
-    extent = [0, freq_max, 0, freq_max]
+    # NaN을 배경색(검정)으로 렌더링
+    cmap_obj = plt.get_cmap(colormap).copy()
+    cmap_obj.set_bad(color="black")
+
+    freq_tick = display_fmax
+    extent = [0, freq_tick, 0, freq_tick]
 
     im = ax.imshow(
         data,
         origin="lower",
         aspect="auto",
         extent=extent,
-        cmap=colormap,
+        cmap=cmap_obj,
         interpolation="nearest",
+        vmin=vmin,
+        vmax=vmax,
     )
 
     if show_axes:
@@ -215,6 +242,16 @@ class AudioToBispectrum:
                         "tooltip": "Magnitude 모드에서 log(1+|B|) 적용 (normalize=OFF일 때만 유효)",
                     },
                 ),
+                "fmax": (
+                    "FLOAT",
+                    {
+                        "default": 8000.0,
+                        "min": 0.0,
+                        "max": 24000.0,
+                        "step": 500.0,
+                        "tooltip": "표시할 최대 주파수 (Hz). 0 = Nyquist 전체",
+                    },
+                ),
                 "colormap": (COLORMAPS, {"default": "inferno"}),
                 "width": (
                     "INT",
@@ -251,6 +288,7 @@ class AudioToBispectrum:
         win_length,
         normalize,
         log_scale,
+        fmax,
         colormap,
         width,
         height,
@@ -269,7 +307,7 @@ class AudioToBispectrum:
 
         image = _render_bispectrum(
             bispec, sample_rate, normalize, log_scale,
-            colormap, width, height, show_axes,
+            colormap, fmax, width, height, show_axes,
         )
 
         return (image,)
